@@ -1,0 +1,6 @@
+discord.py==2.3.2
+python-dotenv==1.0.0
+schedule==1.2.0
+asyncio
+aiofiles==23.2.1
+Pillow==10.1.0
