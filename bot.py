@@ -5,6 +5,8 @@ from discord.ext import commands, tasks
 import os
 import json
 import random
+import shutil
+import glob
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pathlib import Path
@@ -97,13 +99,45 @@ class DailyCog(commands.Cog):
                 categories.append(item.name)
         return categories
     
-    def get_item_ids_in_category(self, category):
-        """Get all item IDs (directory names) in a category - fast O(1) directory read"""
+    def get_category_config(self, category):
+        """Load the category config file if it exists"""
+        config_file = Path(f'data/{category}/config.json')
+        if not config_file.exists():
+            return {}
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading category config {config_file}: {e}")
+            return {}
+
+    def get_disabled_items(self, category, post_type):
+        """Get list of globally disabled item IDs for a category and post type"""
+        category_config = self.get_category_config(category)
+        if post_type in category_config:
+            return category_config[post_type].get('disabled', [])
+        return []
+
+    def get_item_ids_in_category(self, category, post_type=None):
+        """Get all item IDs (directory names) in a category - fast O(1) directory read
+
+        Args:
+            category: The category to get items from
+            post_type: Optional post type ('daily' or 'matchup') to filter out globally disabled items
+        """
         category_dir = Path(f'data/{category}')
         if not category_dir.exists():
             return []
-        return [d.name for d in category_dir.iterdir() if d.is_dir()]
-    
+
+        item_ids = [d.name for d in category_dir.iterdir() if d.is_dir()]
+
+        # Filter out globally disabled items if post_type specified
+        if post_type:
+            disabled_items = self.get_disabled_items(category, post_type)
+            item_ids = [id for id in item_ids if id not in disabled_items]
+
+        return item_ids
+
     def get_item_by_id(self, category, item_id):
         """Load a single item by its ID - O(1) operation"""
         item_dir = Path(f'data/{category}/{item_id}')
@@ -130,24 +164,23 @@ class DailyCog(commands.Cog):
             print(f"Error loading {info_file}: {e}")
             return None
     
-    def get_random_items(self, category, count=1, exclude_ids=None):
+    def get_random_items(self, category, count=1, exclude_ids=[], post_type=None):
         """Get random items without loading all items - optimized for large categories
         
         Args:
             category: The category to pull from
             count: Number of items to select
             exclude_ids: List of item IDs to exclude from selection
+            post_type: Post type ('daily' or 'matchup') to filter out globally disabled items
         """
-        item_ids = self.get_item_ids_in_category(category)
+        # Get item IDs, filtering out globally disabled items if post_type is specified
+        item_ids = self.get_item_ids_in_category(category, post_type=post_type)
         
-        # Filter out excluded items
-        if exclude_ids:
-            available_ids = [id for id in item_ids if id not in exclude_ids]
-        else:
-            available_ids = item_ids
+        # Filter out excluded items (already pulled items)
+        available_ids = [id for id in item_ids if id not in exclude_ids]
         
         if len(available_ids) < count:
-            return None
+            return None, 0
         
         selected_ids = random.sample(available_ids, count)
         items = []
@@ -158,8 +191,10 @@ class DailyCog(commands.Cog):
         
         # Return None if we couldn't load enough valid items
         if len(items) < count:
-            return None
-        return items
+            return None, 0
+        remaining_items = len(available_ids) - len(items)
+
+        return items, remaining_items
     
     def get_pulled_items(self, guild_id, post_type, category):
         """Get list of already pulled item IDs for a guild/post_type/category"""
@@ -356,22 +391,26 @@ class DailyCog(commands.Cog):
         # Get already pulled items to exclude
         pulled_items = self.get_pulled_items(guild_id, 'daily', category) if guild_id else []
         
-        # Try to get a random item excluding already pulled ones
-        random_items = self.get_random_items(category, 1, exclude_ids=pulled_items)
+        # Try to get a random item excluding already pulled ones (and globally disabled items)
+        random_items, remaining_items = self.get_random_items(category, 1, exclude_ids=pulled_items, post_type='daily')
+
+        total_items = len(self.get_item_ids_in_category(category, post_type='daily'))
+
         
         # If no items available (all have been pulled), celebrate and reset!
         if not random_items and pulled_items:
-            total_items = len(self.get_item_ids_in_category(category))
             await channel.send(f"🎉 **Cycle Complete!** We've featured all {total_items} items in {category}! Starting a fresh cycle...")
             await self.clear_pulled_items(guild_id, 'daily', category)
-            random_items = self.get_random_items(category, 1)
+            random_items, remaining_items = self.get_random_items(category, 1, post_type='daily')
         
         if not random_items:
             await channel.send(f"No items found in category: {category}")
             return
         
         random_item = random_items[0]
+
         embed, file = await self.create_item_embed(random_item, f"{category} of the Day: ")
+        embed.set_footer(text=f"📊 {remaining_items} items remaining in pool")
         
         if file:
             await channel.send(embed=embed, file=file)
@@ -386,11 +425,13 @@ class DailyCog(commands.Cog):
     async def post_daily_matchup(self, channel, category, guild_id):
         """Post a daily matchup poll to the channel (no duplicates until all items pulled)"""
         pulled_items = self.get_pulled_items(guild_id, 'matchup', category)
-        all_ids = self.get_item_ids_in_category(category)
-        available_count = len(all_ids) - len(pulled_items)
+        # Get all available IDs (excluding globally disabled items for matchup)
+        all_ids = self.get_item_ids_in_category(category, post_type='matchup')
+        available_ids = [id for id in all_ids if id not in pulled_items]
+        available_count = len(available_ids)
         old_cycle_items = []
         
-        contestants = self.get_random_items(category, min(available_count, 2), exclude_ids=pulled_items)
+        contestants, remaining_items = self.get_random_items(category, min(available_count, 2), exclude_ids=pulled_items, post_type='matchup')
         
         if len(contestants or []) < 2:
             # Cycle complete - store what we got, reset, and get the rest
@@ -402,7 +443,7 @@ class DailyCog(commands.Cog):
             await self.clear_pulled_items(guild_id, 'matchup', category)
             
             needed = 2 - len(old_cycle_items)
-            new_items = self.get_random_items(category, needed, exclude_ids=[c['id'] for c in old_cycle_items])
+            new_items, remaining_items = self.get_random_items(category, needed, exclude_ids=[c['id'] for c in old_cycle_items], post_type='matchup')
             contestants = old_cycle_items + (new_items or [])
         
         if len(contestants) < 2:
@@ -447,6 +488,7 @@ class DailyCog(commands.Cog):
         
         vs_file = discord.File(vs_bytes, filename="vs_matchup.png")
         embed.set_image(url="attachment://vs_matchup.png")
+        embed.set_footer(text=f"📊 {remaining_items} items remaining in pool")
         
         await channel.send(embed=embed, file=vs_file)
         
